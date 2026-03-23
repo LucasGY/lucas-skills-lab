@@ -1,6 +1,7 @@
 ---
 name: fetch-fedwatch
 description: Fetch CME FedWatch public web data, especially the Current target rate table or the Target Rate -> Probabilities conditional meeting probabilities table, and export it to CSV, JSON, or automation scripts without using the paid FedWatch API.
+metadata: {"openclaw":{"homepage":"https://www.cmegroup.com/markets/interest-rates/cme-fedwatch-tool.html?redirect=/trading/interest-rates/countdown-to-fomc.html","requires":{"anyBins":["python","node"]},"install":[{"id":"node-playwright","kind":"node","package":"playwright","bins":["playwright"],"label":"Install Playwright (node)"}]}}
 ---
 
 # Fetch FedWatch
