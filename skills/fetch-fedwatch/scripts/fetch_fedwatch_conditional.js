@@ -14,6 +14,41 @@ function csvEscape(value) {
   return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 }
 
+function parseRateBucket(label) {
+  const match = clean(label).match(/(\d+)\s*-\s*(\d+)/);
+  if (!match) return null;
+  return { low: Number(match[1]), high: Number(match[2]) };
+}
+
+function bucketMidpoint(bucket) {
+  return bucket ? (bucket.low + bucket.high) / 2 : null;
+}
+
+function cutVsCurrentBps(currentLabel, targetLabel) {
+  const current = parseRateBucket(currentLabel);
+  const target = parseRateBucket(targetLabel);
+  if (!current || !target) return '';
+  return String(bucketMidpoint(target) - bucketMidpoint(current));
+}
+
+function parseProbabilityPercent(value) {
+  const match = clean(value).match(/-?\d+(?:\.\d+)?/);
+  return match ? Number(match[0]) : null;
+}
+
+function expectedChangeBps(changeCells, probabilityCells) {
+  let total = 0;
+  let hasValue = false;
+  for (let i = 0; i < Math.min(changeCells.length, probabilityCells.length); i += 1) {
+    const change = Number(changeCells[i]);
+    const probability = parseProbabilityPercent(probabilityCells[i]);
+    if (!Number.isFinite(change) || probability === null) continue;
+    total += (change * probability) / 100;
+    hasValue = true;
+  }
+  return hasValue ? total.toFixed(2) : '';
+}
+
 async function loadFrame() {
   const browser = await chromium.launch({ headless: true });
   const page = await browser.newPage();
@@ -22,8 +57,14 @@ async function loadFrame() {
     waitUntil: 'domcontentloaded',
     timeout: 120000,
   });
-  await page.waitForTimeout(8000);
-  const frame = page.frames().find((f) => /QuikStrikeView\.aspx/.test(f.url())) || page.mainFrame();
+  let frame = null;
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    await page.waitForTimeout(1000);
+    frame = page.frames().find((f) => /QuikStrikeView\.aspx/.test(f.url()));
+    if (frame) break;
+  }
+  frame = frame || page.mainFrame();
+  await frame.locator('#ctl00_MainContent_ucViewControl_IntegratedFedWatchTool_lbPTree').waitFor({ state: 'attached', timeout: 30000 });
   return { browser, page, frame };
 }
 
@@ -52,15 +93,41 @@ function writeCsv(headers, rows, outputPath) {
   fs.writeFileSync(path.resolve(outputPath), csv, 'utf8');
 }
 
+async function getCurrentRateBucket(frame) {
+  const patterns = [
+    /Current target rate is (\d+\s*-\s*\d+)/i,
+    /(\d+\s*-\s*\d+)\s*\(Current\)/i,
+  ];
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const bodyText = await frame.locator('body').innerText();
+    for (const pattern of patterns) {
+      const match = bodyText.match(pattern);
+      if (match) return clean(match[1]);
+    }
+    await frame.page().waitForTimeout(1000);
+  }
+  return null;
+}
+
 async function fetchConditionalMeetingProbabilities(outputPath = 'fedwatch_conditional_probabilities.csv') {
   const { browser, frame } = await loadFrame();
   try {
-    await frame.locator('#ctl00_MainContent_ucViewControl_IntegratedFedWatchTool_lbPTree').click();
+    const currentBucket = await getCurrentRateBucket(frame);
+    await frame.locator('#ctl00_MainContent_ucViewControl_IntegratedFedWatchTool_lbPTree').click({ force: true });
     await new Promise((r) => setTimeout(r, 5000));
     const table = frame.locator('table:has-text("Conditional Meeting Probabilities")').first();
     const { headers, rows } = await extractTable(table);
-    writeCsv(headers, rows, outputPath);
-    return { mode: 'conditional', outputPath: path.resolve(outputPath), headers, rowCount: rows.length, rows };
+    const baseHeaders = [...headers, 'Expected Change vs Current (bps)'];
+    const cutRow = currentBucket
+      ? [`Cut vs Current ${currentBucket} (bps)`, ...headers.slice(1).map((header) => cutVsCurrentBps(currentBucket, header)), '']
+      : null;
+    const outputRows = rows.map((row) => {
+      if (!cutRow) return [...row, ''];
+      return [...row, expectedChangeBps(cutRow.slice(1, -1), row.slice(1))];
+    });
+    const finalRows = cutRow ? [cutRow, ...outputRows] : outputRows;
+    writeCsv(baseHeaders, finalRows, outputPath);
+    return { mode: 'conditional', outputPath: path.resolve(outputPath), headers: baseHeaders, rowCount: finalRows.length, rows: finalRows };
   } finally {
     await browser.close();
   }
@@ -90,7 +157,7 @@ if (require.main === module) {
         outputPath: result.outputPath,
         headers: result.headers,
         rowCount: result.rowCount,
-        sampleRows: result.rows.slice(0, 3),
+        sampleRows: result.rows.slice(0, 4),
       }, null, 2));
     })
     .catch((err) => {

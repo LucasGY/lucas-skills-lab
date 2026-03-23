@@ -1,5 +1,6 @@
 import csv
 import os
+import re
 import sys
 from playwright.sync_api import sync_playwright
 
@@ -9,6 +10,44 @@ REFERER = "https://www.cmegroup.com/markets/interest-rates/cme-fedwatch-tool.htm
 
 def clean(text: str) -> str:
     return " ".join((text or "").split())
+
+
+def parse_rate_bucket(label: str):
+    match = re.search(r"(\d+)\s*-\s*(\d+)", clean(label))
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
+def cut_vs_current_bps(current_label: str, target_label: str) -> str:
+    current = parse_rate_bucket(current_label)
+    target = parse_rate_bucket(target_label)
+    if not current or not target:
+        return ""
+    current_mid = sum(current) / 2
+    target_mid = sum(target) / 2
+    return str(int(target_mid - current_mid))
+
+
+def parse_probability_percent(value: str):
+    match = re.search(r"-?\d+(?:\.\d+)?", clean(value))
+    return float(match.group(0)) if match else None
+
+
+def expected_change_bps(change_cells, probability_cells) -> str:
+    total = 0.0
+    has_value = False
+    for change, probability in zip(change_cells, probability_cells):
+        try:
+            change_value = float(change)
+        except (TypeError, ValueError):
+            continue
+        probability_value = parse_probability_percent(probability)
+        if probability_value is None:
+            continue
+        total += change_value * probability_value / 100.0
+        has_value = True
+    return f"{total:.2f}" if has_value else ""
 
 
 def write_csv(headers, rows, output_path: str):
@@ -40,25 +79,58 @@ def load_frame():
     browser = p.chromium.launch(headless=True)
     page = browser.new_page()
     page.goto(TOOL_URL, referer=REFERER, wait_until="domcontentloaded", timeout=120000)
-    page.wait_for_timeout(8000)
-    frame = next((f for f in page.frames if "QuikStrikeView.aspx" in f.url), page.main_frame)
+    frame = None
+    for _ in range(20):
+        page.wait_for_timeout(1000)
+        frame = next((f for f in page.frames if "QuikStrikeView.aspx" in f.url), None)
+        if frame:
+            break
+    frame = frame or page.main_frame
+    frame.locator("#ctl00_MainContent_ucViewControl_IntegratedFedWatchTool_lbPTree").wait_for(state="attached", timeout=30000)
     return p, browser, page, frame
+
+
+def get_current_rate_bucket(frame):
+    patterns = [
+        r"Current target rate is (\d+\s*-\s*\d+)",
+        r"(\d+\s*-\s*\d+)\s*\(Current\)",
+    ]
+    for _ in range(5):
+        body_text = frame.locator("body").inner_text()
+        for pattern in patterns:
+            match = re.search(pattern, body_text, re.IGNORECASE)
+            if match:
+                return clean(match.group(1))
+        frame.page.wait_for_timeout(1000)
+    return None
 
 
 def fetch_conditional_meeting_probabilities(output_path: str = "fedwatch_conditional_probabilities.csv"):
     p, browser, page, frame = load_frame()
     try:
-        frame.locator("#ctl00_MainContent_ucViewControl_IntegratedFedWatchTool_lbPTree").click()
+        current_bucket = get_current_rate_bucket(frame)
+        frame.locator("#ctl00_MainContent_ucViewControl_IntegratedFedWatchTool_lbPTree").click(force=True)
         page.wait_for_timeout(5000)
         table = frame.locator('table:has-text("Conditional Meeting Probabilities")').first
         headers, rows = extract_table(table)
-        write_csv(headers, rows, output_path)
+        final_headers = [*headers, "Expected Change vs Current (bps)"]
+        cut_row = None
+        if current_bucket:
+            cut_row = [f"Cut vs Current {current_bucket} (bps)", *[cut_vs_current_bps(current_bucket, header) for header in headers[1:]], ""]
+        output_rows = []
+        for row in rows:
+            if cut_row:
+                output_rows.append([*row, expected_change_bps(cut_row[1:-1], row[1:])])
+            else:
+                output_rows.append([*row, ""])
+        final_rows = [cut_row, *output_rows] if cut_row else output_rows
+        write_csv(final_headers, final_rows, output_path)
         return {
             "mode": "conditional",
             "output_path": os.path.abspath(output_path),
-            "headers": headers,
-            "row_count": len(rows),
-            "rows": rows,
+            "headers": final_headers,
+            "row_count": len(final_rows),
+            "rows": final_rows,
         }
     finally:
         browser.close()
@@ -95,5 +167,5 @@ if __name__ == "__main__":
         "output_path": result["output_path"],
         "headers": result["headers"],
         "row_count": result["row_count"],
-        "sample_rows": result["rows"][:3],
+        "sample_rows": result["rows"][:4],
     })
