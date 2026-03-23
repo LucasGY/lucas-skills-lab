@@ -1,0 +1,12 @@
+{
+  "name": "fetch-fedwatch-skill",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Node tooling for the fetch-fedwatch skill.",
+  "scripts": {
+    "fetch": "node scripts/fetch_fedwatch_conditional.js"
+  },
+  "dependencies": {
+    "playwright": "^1.58.2"
+  }
+}
