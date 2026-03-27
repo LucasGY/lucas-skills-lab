@@ -22,9 +22,41 @@ INSERT IGNORE INTO index_valuation (trade_date, index_name, pe_ntm)
 VALUES (%s, %s, %s)
 """.strip()
 
+SKILL_DIR = Path(__file__).resolve().parents[1]
+DEFAULT_ENV_PATH = SKILL_DIR / ".env.local"
 DEFAULT_CSV_PATH = Path("tmp/Data View Export.csv")
 BATCH_SIZE = 500
 MISSING_VALUE_MARKERS = {"", "-", "NA", "N/A", "@NA", "NULL", "NONE"}
+
+
+def parse_env_file(path):
+    values = {}
+    if not path.is_file():
+        return values
+
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+            value = value[1:-1]
+        values[key] = value
+    return values
+
+
+def get_config_value(cli_value, env_name, env_values, default=None, cast=None):
+    value = cli_value if cli_value is not None else os.getenv(env_name)
+    if value is None:
+        value = env_values.get(env_name, default)
+    if cast is not None and value is not None:
+        try:
+            return cast(value)
+        except ValueError as exc:
+            raise SystemExit(f"Invalid value for {env_name}: {value}") from exc
+    return value
 
 
 def parse_args():
@@ -36,18 +68,16 @@ def parse_args():
         default=str(DEFAULT_CSV_PATH),
         help="Path to the source CSV file.",
     )
-    parser.add_argument("--db-host", default=os.getenv("DB_HOST"), help="MariaDB host.")
     parser.add_argument(
-        "--db-port",
-        type=int,
-        default=int(os.getenv("DB_PORT", "3306")),
-        help="MariaDB port.",
+        "--env-file",
+        default=str(DEFAULT_ENV_PATH),
+        help="Path to the local env file. Defaults to the skill's .env.local.",
     )
-    parser.add_argument("--db-user", default=os.getenv("DB_USER"), help="MariaDB user.")
-    parser.add_argument(
-        "--db-password", default=os.getenv("DB_PASSWORD"), help="MariaDB password."
-    )
-    parser.add_argument("--db-name", default=os.getenv("DB_NAME"), help="MariaDB database name.")
+    parser.add_argument("--db-host", default=None, help="MariaDB host.")
+    parser.add_argument("--db-port", type=int, default=None, help="MariaDB port.")
+    parser.add_argument("--db-user", default=None, help="MariaDB user.")
+    parser.add_argument("--db-password", default=None, help="MariaDB password.")
+    parser.add_argument("--db-name", default=None, help="MariaDB database name.")
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -58,7 +88,16 @@ def parse_args():
         default="utf-8-sig",
         help="CSV file encoding. Defaults to utf-8-sig.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    env_values = parse_env_file(Path(args.env_file))
+    args.db_host = get_config_value(args.db_host, "DB_HOST", env_values)
+    args.db_port = get_config_value(args.db_port, "DB_PORT", env_values, default=3306, cast=int)
+    args.db_user = get_config_value(args.db_user, "DB_USER", env_values)
+    args.db_password = get_config_value(args.db_password, "DB_PASSWORD", env_values)
+    args.db_name = get_config_value(args.db_name, "DB_NAME", env_values)
+    args.env_file = str(Path(args.env_file).resolve())
+    return args
 
 
 def require_pymysql():
@@ -178,6 +217,7 @@ def main():
     parsed = load_rows(args.csv_path, args.encoding)
     summary = {
         "csv_path": parsed["csv_path"],
+        "env_file": args.env_file,
         "source_row_count": parsed["source_row_count"],
         "index_count": parsed["index_count"],
         "record_count": parsed["record_count"],
